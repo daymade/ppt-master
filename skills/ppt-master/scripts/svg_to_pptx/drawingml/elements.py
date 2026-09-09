@@ -2533,10 +2533,12 @@ def _estimate_bullet_line_width(
     runs: list[dict[str, Any]],
     default_fonts: dict[str, str],
     ctx: ConvertContext,
+    *,
+    include_headroom: bool = False,
 ) -> float:
     line_runs, bullet = _extract_text_bullet(runs)
     line_runs = _coalesce_text_runs(line_runs, default_fonts, ctx)
-    width = _estimate_text_runs_width(line_runs, include_headroom=False)
+    width = _estimate_text_runs_width(line_runs, include_headroom=include_headroom)
     if bullet:
         fs_px = float(line_runs[0].get('font_size', 16)) if line_runs else 16.0
         width += _bullet_margin_px(bullet, fs_px)
@@ -3172,7 +3174,12 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
                 continue
             visual_line_runs.append(line_runs)
             visual_line_widths.append(
-                _estimate_bullet_line_width(line_runs, fonts, ctx)
+                _estimate_bullet_line_width(
+                    line_runs, fonts, ctx,
+                    # Preserve authored breaks with the same font slack as
+                    # single-line frames. Reflow retains its original wrap width.
+                    include_headroom=ctx.text_flow == TEXT_FLOW_PRESERVE,
+                )
             )
             soft_break = child.get('data-paragraph-soft-break') == '1'
             line_break = child.get('data-paragraph-line-break') == '1'
@@ -3566,6 +3573,14 @@ def convert_text(elem: ET.Element, ctx: ConvertContext) -> ShapeResult | None:
             '<a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" '
             'anchor="t" anchorCtr="0">\n<a:spAutoFit/>\n</a:bodyPr>'
         )
+
+    text_autofit = elem.get('data-pptx-text-autofit')
+    if text_autofit not in {None, 'none'}:
+        raise ValueError('data-pptx-text-autofit supports only "none"; omit it for the default')
+    if text_autofit == 'none':
+        # Some consumers rewrap spAutoFit frames despite wrap="none".
+        # Opt in to fixed editable frames without changing authored geometry.
+        body_pr_xml = body_pr_xml.replace('<a:spAutoFit/>', '<a:noAutofit/>')
 
     shape_xml = f'''<p:sp>
 <p:nvSpPr>

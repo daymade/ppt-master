@@ -35,6 +35,7 @@ from svg_to_pptx.drawingml.converter import (  # noqa: E402
     convert_svg_to_slide_shapes,
 )
 from svg_to_pptx.drawingml.styles import build_gradient_fill  # noqa: E402
+from svg_to_pptx.native_objects.fallback_hash import stamp_native_fallback_baseline  # noqa: E402
 from svg_to_pptx.pptx_package.discovery import find_notes_files  # noqa: E402
 
 
@@ -592,6 +593,85 @@ class NativeExportGuardTests(unittest.TestCase):
                 self.assertEqual(len(slide.findall('.//p:sp', NS)), 2 if text_flow == 'split' else 1)
                 if text_flow == 'preserve':
                     self.assertEqual(len(slide.findall('.//a:br', NS)), 1)
+
+    def test_preserved_multiline_text_keeps_single_line_headroom_within_column(self) -> None:
+        self._svg(
+            '<text x="100" y="120">2040年12月09日版本说明'
+            '<tspan x="100" dy="44">第二行文字</tspan></text>',
+            'font-family="Microsoft YaHei" font-size="32"',
+        )
+        slides = {}
+        widths = {}
+        for flow in ('preserve', 'reflow', 'split'):
+            xml, *_ = convert_svg_to_slide_shapes(self.svg_path, resource_root=self.root, text_flow=flow)
+            slides[flow] = ET.fromstring(xml)
+            frame = slides[flow].find('.//p:sp/p:spPr/a:xfrm', NS)
+            widths[flow] = int(frame.find('a:ext', NS).get('cx'))
+        preserved = slides['preserve']
+        self.assertEqual(len(preserved.findall('.//p:sp', NS)), 1)
+        self.assertEqual(len(preserved.findall('.//a:br', NS)), 1)
+        self.assertEqual(preserved.find('.//a:bodyPr', NS).get('wrap'), 'none')
+        self.assertIsNotNone(preserved.find('.//a:bodyPr/a:spAutoFit', NS))
+        self.assertEqual(widths['preserve'], widths['split'])
+        self.assertGreater(widths['preserve'], widths['reflow'])
+        frame = preserved.find('.//p:sp/p:spPr/a:xfrm', NS)
+        right = int(frame.find('a:off', NS).get('x')) + widths['preserve']
+        self.assertLess(right, 520 * 9525)  # The neighboring column starts here.
+        self.assertEqual([t.text for t in preserved.findall('.//a:t', NS)],
+                         ['2040年12月09日版本说明', '第二行文字'])
+
+    def test_native_table_keeps_authored_paragraphs_editable(self) -> None:
+        payload = {
+            'schema': 'ppt-master.semantic-table.v2',
+            'x': 100, 'y': 100, 'width': 360, 'height': 100,
+            'header_rows': 0,
+            'rows': [[{'paragraphs': ['登记名称', '（补充说明）']}]],
+        }
+        self._svg(
+            '<g data-pptx-replace-with="table" data-pptx-bounds="100 100 360 100">'
+            f'<metadata type="application/json">{json.dumps(payload, ensure_ascii=False)}</metadata>'
+            '<text x="110" y="132">登记名称<tspan x="110" dy="32">（补充说明）</tspan></text>'
+            '</g>'
+        )
+        tree = ET.parse(self.svg_path)
+        marker = next(e for e in tree.getroot() if e.get('data-pptx-replace-with') == 'table')
+        stamp_native_fallback_baseline(marker)
+        tree.write(self.svg_path, encoding='utf-8')
+        xml, *_ = convert_svg_to_slide_shapes(self.svg_path, resource_root=self.root, native_objects=True)
+        slide = ET.fromstring(xml)
+        self.assertEqual(len(slide.findall('.//a:tbl', NS)), 1)
+        self.assertEqual(len(slide.findall('.//p:pic', NS)), 0)
+        paragraphs = slide.findall('.//a:tc/a:txBody/a:p', NS)
+        self.assertEqual([''.join(t.text or '' for t in p.findall('.//a:t', NS)) for p in paragraphs],
+                         ['登记名称', '（补充说明）'])
+
+    def test_fixed_text_autofit_preserves_geometry_runs_and_column_boundary(self) -> None:
+        for body in (
+            '资料〔2040〕123号',
+            '2040年12月09日版本说明<tspan x="100" dy="44">第二行文字</tspan>',
+        ):
+            with self.subTest(body=body):
+                self._svg(f'<text x="100" y="120">{body}</text>',
+                          'font-family="Microsoft YaHei" font-size="32"')
+                default = self._export()
+                self._svg(f'<text x="100" y="120" data-pptx-text-autofit="none">{body}</text>',
+                          'font-family="Microsoft YaHei" font-size="32"')
+                fixed = self._export()
+                self.assertIsNotNone(fixed.find('.//a:bodyPr/a:noAutofit', NS))
+                self.assertEqual(fixed.find('.//a:bodyPr', NS).get('wrap'), 'none')
+                bp = default.find('.//a:bodyPr', NS)
+                bp.remove(bp.find('a:spAutoFit', NS))
+                # Normalize only the intentionally changed auto-fit node.
+                ET.SubElement(bp, f'{{{NS["a"]}}}noAutofit').tail = '\n'
+                self.assertEqual(ET.tostring(default), ET.tostring(fixed))
+                frame = fixed.find('.//p:sp/p:spPr/a:xfrm', NS)
+                right = int(frame.find('a:off', NS).get('x')) + int(frame.find('a:ext', NS).get('cx'))
+                self.assertLess(right, 520 * 9525)
+
+    def test_unknown_text_autofit_is_rejected(self) -> None:
+        self._svg('<text x="100" y="120" data-pptx-text-autofit="shrink">Text</text>')
+        with self.assertRaisesRegex(SvgNativeConversionError, 'data-pptx-text-autofit'):
+            self._export()
 
     def test_line_starter_dx_is_consumed_once_and_small_dy_still_splits(self) -> None:
         self._svg(
